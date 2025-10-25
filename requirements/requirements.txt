@@ -1,0 +1,5 @@
+# Python requirements
+psycopg2-binary
+python-dotenv
+alembic
+sqlalchemy

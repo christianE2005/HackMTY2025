@@ -3,6 +3,7 @@
 FastAPI endpoint para predicción de consumo en vuelos
 """
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
 import joblib
@@ -34,6 +35,15 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Habilitar CORS para uso desde frontend (ajusta allow_origins en producción)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:8000", "*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Modelos Pydantic para request/response
 class PredictionRequest(BaseModel):
     origen: str = Field(..., description="Código del aeropuerto de origen (ej: DOH, JFK, LHR)")
@@ -41,7 +51,8 @@ class PredictionRequest(BaseModel):
     service_type: str = Field(..., description="Tipo de servicio (Retail, Pick & Pack)")
     passenger_count: int = Field(..., gt=0, description="Número de pasajeros")
     lista_productos: List[str] = Field(..., description="Lista de nombres de productos")
-    buffer_pct: int = Field(default=10, ge=0, le=50, description="Porcentaje de buffer adicional (0-50%)")
+    # Accept float so frontends can send fractional percentages (we'll round when returning)
+    buffer_pct: float = Field(default=10.0, ge=0, le=50, description="Porcentaje de buffer adicional (0-50%)")
 
     class Config:
         json_schema_extra = {
@@ -96,9 +107,9 @@ def health_check():
 def get_metadata():
     """Retorna los valores válidos para origen, tipo de vuelo, servicio y productos"""
     return {
-        "valid_origins": origin_list,
-        "valid_flight_types": flight_type_list,
-        "valid_service_types": service_type_list,
+        "valid_origins": ["DOH"],
+        "valid_flight_types": ["medium-haul"],
+        "valid_service_types": ["Retail"],
         "available_products": product_list
     }
 
@@ -113,19 +124,28 @@ def predict_consumption(request: PredictionRequest):
     if request.origen not in origin_list:
         raise HTTPException(
             status_code=400,
-            detail=f"Origen '{request.origen}' no válido. Valores válidos: {origin_list}"
+            detail={
+                "error": f"Origen '{request.origen}' no válido.",
+                "valid_origins": origin_list
+            }
         )
     
     if request.flight_type not in flight_type_list:
         raise HTTPException(
             status_code=400,
-            detail=f"Tipo de vuelo '{request.flight_type}' no válido. Valores válidos: {flight_type_list}"
+            detail={
+                "error": f"Tipo de vuelo '{request.flight_type}' no válido.",
+                "valid_flight_types": flight_type_list
+            }
         )
     
     if request.service_type not in service_type_list:
         raise HTTPException(
             status_code=400,
-            detail=f"Tipo de servicio '{request.service_type}' no válido. Valores válidos: {service_type_list}"
+            detail={
+                "error": f"Tipo de servicio '{request.service_type}' no válido.",
+                "valid_service_types": service_type_list
+            }
         )
     
     results = []
@@ -161,9 +181,10 @@ def predict_consumption(request: PredictionRequest):
         results.append({
             "Product": product_name,
             "Qty_Per_Pax": round(predicted_qty_per_pax, 3),
-            "Base_Load": int(base_load),
-            "Buffer_%": request.buffer_pct,
-            "Suggested_Load": int(suggested_load),
+            "Base_Load": int(round(base_load)),
+            # Return buffer percent as integer (rounded)
+            "Buffer_%": int(round(request.buffer_pct)),
+            "Suggested_Load": int(round(suggested_load)),
             "Hist_Avg": hist_avg,
             "Hist_Max": hist_max
         })
@@ -171,7 +192,10 @@ def predict_consumption(request: PredictionRequest):
     if not results:
         raise HTTPException(
             status_code=400,
-            detail="No se pudieron generar predicciones. Verifica que los productos sean válidos."
+            detail={
+                "error": "No se pudieron generar predicciones. Verifica que los productos sean válidos.",
+                "available_products": product_list
+            }
         )
     
     total_load = sum(r["Suggested_Load"] for r in results)
@@ -181,5 +205,90 @@ def predict_consumption(request: PredictionRequest):
         total_suggested_load=total_load,
         warnings=warnings
     )
+
+
+@app.post("/predict-flex", response_model=PredictionResponse)
+def predict_consumption_flex(payload: dict):
+    """Endpoint flexible para frontend que envía campos en camelCase o en inglés.
+    Normaliza keys y llama a la función principal de predicción.
+    """
+    # Mapear posibles aliases desde el frontend
+    mapping = {
+        'origin': 'origen',
+        'origen': 'origen',
+        'flightType': 'flight_type',
+        'flight_type': 'flight_type',
+        'serviceType': 'service_type',
+        'service_type': 'service_type',
+        'passengerCount': 'passenger_count',
+        'passenger_count': 'passenger_count',
+        'products': 'lista_productos',
+        'lista_productos': 'lista_productos',
+        'bufferPercent': 'buffer_pct',
+        'buffer_pct': 'buffer_pct'
+    }
+
+    normalized = {}
+    for k, v in payload.items():
+        key = mapping.get(k, None)
+        if key:
+            normalized[key] = v
+    # Validate required fields
+    required = ['origen', 'flight_type', 'service_type', 'passenger_count', 'lista_productos']
+    missing = [r for r in required if r not in normalized]
+    if missing:
+        raise HTTPException(status_code=422, detail=f"Faltan campos requeridos: {missing}")
+
+    # Build a PredictionRequest-like object
+    req_obj = PredictionRequest(
+        origen=normalized['origen'],
+        flight_type=normalized['flight_type'],
+        service_type=normalized['service_type'],
+        passenger_count=normalized['passenger_count'],
+        lista_productos=normalized['lista_productos'],
+        buffer_pct=normalized.get('buffer_pct', 10)
+    )
+
+    return predict_consumption(req_obj)
+
+
+@app.post("/predict-simple", response_model=PredictionResponse)
+def predict_consumption_simple(payload: dict):
+    """Endpoint simplificado sin validación de origen/flight_type/service_type.
+    Hardcodea valores predeterminados y solo requiere passengerCount y products.
+    
+    Payload esperado:
+    {
+        "passengerCount": 247,
+        "products": ["Instant Coffee Stick", "Still Water 500ml"],
+        "bufferPercent": 5  // opcional, default 10
+    }
+    """
+    # Valores hardcodeados (usar los primeros valores disponibles en las listas)
+    HARDCODED_ORIGIN = origin_list[0] if origin_list else "DOH"
+    HARDCODED_FLIGHT_TYPE = flight_type_list[0] if flight_type_list else "medium-haul"
+    HARDCODED_SERVICE_TYPE = service_type_list[0] if service_type_list else "Retail"
+    
+    # Extraer campos del payload
+    passenger_count = payload.get('passengerCount') or payload.get('passenger_count')
+    products = payload.get('products') or payload.get('lista_productos')
+    buffer_pct = payload.get('bufferPercent') or payload.get('buffer_pct', 10)
+    
+    if not passenger_count:
+        raise HTTPException(status_code=422, detail="Campo requerido: passengerCount")
+    if not products:
+        raise HTTPException(status_code=422, detail="Campo requerido: products (array de nombres de productos)")
+    
+    # Construir request con valores hardcodeados
+    req_obj = PredictionRequest(
+        origen=HARDCODED_ORIGIN,
+        flight_type=HARDCODED_FLIGHT_TYPE,
+        service_type=HARDCODED_SERVICE_TYPE,
+        passenger_count=passenger_count,
+        lista_productos=products,
+        buffer_pct=buffer_pct
+    )
+    
+    return predict_consumption(req_obj)
 
 # Para ejecutar: uvicorn src.api:app --reload

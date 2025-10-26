@@ -58,9 +58,9 @@ class PredictionRequest(BaseModel):
         json_schema_extra = {
             "example": {
                 "origen": "DOH",
-                "flight_type": "medium-haul",
+                "flight_type": "long-haul",
                 "service_type": "Retail",
-                "passenger_count": 247,
+                "passenger_count": 274,
                 "lista_productos": [
                     "Instant Coffee Stick",
                     "Still Water 500ml",
@@ -108,7 +108,7 @@ def get_metadata():
     """Retorna los valores válidos para origen, tipo de vuelo, servicio y productos"""
     return {
         "valid_origins": ["DOH"],
-        "valid_flight_types": ["medium-haul"],
+        "valid_flight_types": ["long-haul"],
         "valid_service_types": ["Retail"],
         "available_products": product_list
     }
